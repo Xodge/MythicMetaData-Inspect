@@ -22,7 +22,6 @@ A companion addon to [Mythic Meta Data](https://www.curseforge.com/wow/addons/my
 | `/mmdi scan` | Capture all current group/raid members at once |
 | `/mmdi review` | Open the purge review window (hold entries to keep) |
 | `/mmdi purge` | Remove all entries eligible for purge (older than 4 hours, not held) |
-| `/mmdi test` | Capture your own character to verify the pipeline works |
 | `/mmdi dump [unit]` | Print the raw API response for a unit (default: target) |
 
 ## Notes
