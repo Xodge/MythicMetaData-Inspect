@@ -1,0 +1,9 @@
+package-as: MythicMetaData-Inspect
+
+curse-project-id: 1710507
+
+ignore:
+  - .pkgmeta
+  - .github
+  - README.md
+  - CHANGELOG.md

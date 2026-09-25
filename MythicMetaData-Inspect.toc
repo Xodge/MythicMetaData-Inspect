@@ -1,0 +1,14 @@
+## Interface: 120100
+## Title: Mythic Meta Data - Inspect
+## Notes: Shows Mythic+ history (via Inspect or /mmdi scan) for group/raid members -- local only, never synced or written into MMD's guild-tracked data.
+## Author: KaldaraWorks
+## Version: 1.0.0
+## RequiredDeps: MythicMetaData
+## SavedVariables: MythicMetaDataInspectDB
+
+Core.lua
+Capture.lua
+Context.lua
+Purge.lua
+ReviewUI.lua
+UI.lua
