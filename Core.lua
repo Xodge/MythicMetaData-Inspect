@@ -21,7 +21,7 @@ _G.MMDI = MMDI -- convenient global for debugging via /run
 --       context = "Group" | "M+" | "Raid",  -- inferred at capture, may be relabeled later (see Context.lua)
 --       holdUntil = <epoch> or nil,      -- set via /mmdi review's "do not purge" checkbox
 --       seasonScore = <number> or nil,
---       dungeons = { [mapID] = { completed = n }, ... },  -- completed only; Blizzard doesn't expose others' fails
+--       dungeons = { [mapID] = { completed = n }, ... },  -- completed only; Capture.lua filters out runs the API marks finishedSuccess == false
 --     },
 --   },
 -- }
@@ -32,6 +32,7 @@ _G.MMDI = MMDI -- convenient global for debugging via /run
 
 local DEFAULTS = {
     entries = {},
+    debug = false,
 }
 
 local function applyDefaults(db, defaults)
@@ -130,7 +131,10 @@ SlashCmdList["MYTHICMETADATAINSPECT"] = function(msg)
         MMDI.Capture_DumpUnit(args[2] or "target")
     elseif cmd == "test" then
         MMDI.Capture_Test()
+    elseif cmd == "debug" then
+        MMDI.db.debug = not MMDI.db.debug
+        print(string.format("|cff66ccffMMDI|r: debug logging %s.", MMDI.db.debug and "ON" or "OFF"))
     else
-        print("|cff66ccffMMDI|r commands: scan, show, review, purge, test")
+        print("|cff66ccffMMDI|r commands: scan, show, review, purge, test, debug")
     end
 end
