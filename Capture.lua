@@ -1,7 +1,8 @@
 -- Capture.lua
 -- The ONLY two ways data ever enters MMD-I's store:
---   1. Passive: hooking NotifyInspect (fires the moment you Inspect
---      someone) -- one unit at a time.
+--   1. Passive: hooking NotifyInspect to know who was asked about, then
+--      actually capturing on INSPECT_READY once the server has answered
+--      -- one unit at a time.
 --   2. Active: /mmdi scan -- loops your current party/raid, calling the
 --      same underlying API directly, no InspectFrame involved at all.
 -- No periodic re-checks, no background polling, no reacting to roster
@@ -43,6 +44,16 @@ local SCORE_FIELD_CANDIDATES = { "currentSeasonScore", "overallScore", "score", 
 local RUNS_FIELD_CANDIDATES = { "runs", "completedRuns", "runHistory", "seasonRuns" }
 local RUN_MAPID_FIELD_CANDIDATES = { "mapChallengeModeID", "challengeModeID", "dungeonID", "mapID" }
 local RUN_LEVEL_FIELD_CANDIDATES = { "bestRunLevel", "level", "keyLevel", "mythicLevel" }
+-- CONFIRMED against the live API docs (Blizzard's MythicPlusRatingSummary /
+-- MythicPlusRatingMapSummary shape): currentSeasonScore, runs[], and within
+-- each run challengeModeID / bestRunLevel all match candidates already above,
+-- so the guesswork this file's header worried about turned out fine. What's
+-- new here is finishedSuccess -- a per-run field this parser wasn't reading
+-- at all, meaning a depleted/failed key could get stored and displayed
+-- identically to a completed one. Skip runs explicitly marked unfinished;
+-- leave anything where the field itself is missing/unrecognized alone so a
+-- future API shape change fails soft instead of silently dropping real runs.
+local RUN_FINISHED_FIELD_CANDIDATES = { "finishedSuccess", "completed", "success" }
 
 local function firstField(t, candidates)
     for _, name in ipairs(candidates) do
@@ -74,7 +85,12 @@ local function parseRatingSummary(unit)
         for _, run in ipairs(runsList) do
             local mapID = firstField(run, RUN_MAPID_FIELD_CANDIDATES)
             local level = firstField(run, RUN_LEVEL_FIELD_CANDIDATES)
-            if mapID and level then
+            local finished = firstField(run, RUN_FINISHED_FIELD_CANDIDATES)
+            -- finished == false means Blizzard explicitly told us this run
+            -- was depleted/abandoned; finished == nil means the field wasn't
+            -- found at all (old behavior, unchanged). Either way, only a
+            -- confirmed false is excluded.
+            if mapID and level and finished ~= false then
                 -- Keep the highest level seen per dungeon, in case the
                 -- runs list isn't already deduplicated/best-only.
                 dungeons[mapID] = { completed = math.max((dungeons[mapID] or {}).completed or 0, level) }
@@ -91,19 +107,39 @@ end
 
 function MMDI.Capture_Unit(unit)
     if InCombatLockdown() then
+        if MMDI.db and MMDI.db.debug then
+            print("|cff888888MMDI debug|r: Capture_Unit(" .. tostring(unit) .. ") aborted -- in combat")
+        end
         return -- hard gate: never capture in combat, no exceptions
     end
     if not UnitExists(unit) or not UnitIsPlayer(unit) then
+        if MMDI.db and MMDI.db.debug then
+            print("|cff888888MMDI debug|r: Capture_Unit(" .. tostring(unit) .. ") aborted -- unit doesn't exist or isn't a player")
+        end
         return
     end
 
     local name, realm = UnitName(unit)
-    if not name then return end
+    if not name then
+        if MMDI.db and MMDI.db.debug then
+            print("|cff888888MMDI debug|r: Capture_Unit(" .. tostring(unit) .. ") aborted -- UnitName returned nothing")
+        end
+        return
+    end
     realm = (realm and realm ~= "") and realm or GetRealmName()
     local charKey = name .. "-" .. realm
 
     local seasonScore, dungeons = parseRatingSummary(unit)
-    if seasonScore == nil and (not dungeons or not next(dungeons)) then
+    local dungeonCount = 0
+    if dungeons then
+        for _ in pairs(dungeons) do dungeonCount = dungeonCount + 1 end
+    end
+    if seasonScore == nil and dungeonCount == 0 then
+        if MMDI.db and MMDI.db.debug then
+            print(string.format(
+                "|cff888888MMDI debug|r: Capture_Unit(%s / %s) got NOTHING usable from GetPlayerMythicPlusRatingSummary -- run /mmdi dump %s to see the raw table",
+                tostring(unit), charKey, tostring(unit)))
+        end
         return -- nothing usable came back; don't overwrite a possibly-better existing entry with emptiness
     end
 
@@ -114,14 +150,85 @@ function MMDI.Capture_Unit(unit)
         seasonScore = seasonScore,
         dungeons = dungeons or {},
     }
+
+    if MMDI.db and MMDI.db.debug then
+        print(string.format("|cff888888MMDI debug|r: Capture_Unit stored %s -- score=%s, dungeons=%d",
+            charKey, tostring(seasonScore), dungeonCount))
+    end
 end
 
--- Passive path: fires the instant an Inspect is requested (right-click
--- > Inspect, or the equivalent), independent of whether InspectFrame's
--- own gear/talent data has finished loading yet -- GetPlayerMythicPlus
--- RatingSummary doesn't need that handshake.
+-- Passive path: THIS WAS THE BUG. NotifyInspect only sends the request to
+-- the server -- per Blizzard's own docs it "triggers INSPECT_READY when
+-- information is asynchronously available," same as the talent handshake
+-- every other inspect addon has to wait on. Capturing inside the
+-- NotifyInspect hook itself, as this used to do, read
+-- GetPlayerMythicPlusRatingSummary before the response had come back, so it
+-- only worked when the client happened to already have a cached answer for
+-- that person (e.g. inspected them moments earlier). That's exactly the
+-- "sometimes works, mostly doesn't" pattern -- it was a race against network
+-- latency, not a parsing problem. Now: record who we asked and their GUID,
+-- then capture only once INSPECT_READY confirms that unit's data is in.
+local pendingInspect = nil -- { unit = <token at request time>, guid = <their GUID> }
+
 hooksecurefunc("NotifyInspect", function(unit)
-    if MMDI.IsFullyLoaded and MMDI.IsFullyLoaded() then
+    if not (MMDI.IsFullyLoaded and MMDI.IsFullyLoaded()) then return end
+    local guid = UnitGUID(unit)
+    if guid then
+        pendingInspect = { unit = unit, guid = guid }
+        if MMDI.db and MMDI.db.debug then
+            print(string.format("|cff888888MMDI debug|r: NotifyInspect(%s) -- guid=%s, awaiting INSPECT_READY", unit, guid))
+        end
+    elseif MMDI.db and MMDI.db.debug then
+        print("|cff888888MMDI debug|r: NotifyInspect(" .. tostring(unit) .. ") -- UnitGUID returned nothing, not tracking this request")
+    end
+end)
+
+-- The unit token captured at request time (e.g. "target") may no longer
+-- point at the same person by the time INSPECT_READY fires -- target could
+-- have changed, or scrolled off in a raid frame click. Re-resolve by GUID
+-- across the places an inspect could plausibly have come from.
+local function resolveUnitByGUID(guid)
+    if pendingInspect and UnitGUID(pendingInspect.unit) == guid then
+        return pendingInspect.unit
+    end
+    if UnitGUID("target") == guid then return "target" end
+    if UnitGUID("mouseover") == guid then return "mouseover" end
+    if IsInRaid() then
+        for i = 1, GetNumGroupMembers() do
+            local u = "raid" .. i
+            if UnitGUID(u) == guid then return u end
+        end
+    elseif IsInGroup() then
+        for i = 1, 4 do
+            local u = "party" .. i
+            if UnitGUID(u) == guid then return u end
+        end
+    end
+    return nil
+end
+
+local inspectReadyFrame = CreateFrame("Frame")
+inspectReadyFrame:RegisterEvent("INSPECT_READY")
+inspectReadyFrame:SetScript("OnEvent", function(_, _, guid)
+    if not (MMDI.IsFullyLoaded and MMDI.IsFullyLoaded()) then return end
+    local debugOn = MMDI.db and MMDI.db.debug
+    if not pendingInspect then
+        if debugOn then print("|cff888888MMDI debug|r: INSPECT_READY(" .. tostring(guid) .. ") -- no pending request, ignoring") end
+        return
+    end
+    if pendingInspect.guid ~= guid then
+        if debugOn then
+            print(string.format("|cff888888MMDI debug|r: INSPECT_READY(%s) -- doesn't match pending %s, ignoring",
+                tostring(guid), tostring(pendingInspect.guid)))
+        end
+        return -- an inspect this session didn't request, or a stale signal
+    end
+    local unit = resolveUnitByGUID(guid)
+    if debugOn then
+        print(string.format("|cff888888MMDI debug|r: INSPECT_READY(%s) matched -- resolved unit=%s", guid, tostring(unit)))
+    end
+    pendingInspect = nil
+    if unit then
         MMDI.Capture_Unit(unit)
     end
 end)
